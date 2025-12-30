@@ -75,10 +75,21 @@
             });
             if (!res.ok) {
                 const errText = await res.text();
-                if(errText.includes("files.content.write")) throw new Error("Permission Dropbox manquante : 'files.content.write' requise pour publier.");
+                if(errText.includes("files.content.write")) throw new Error("Permission Dropbox manquante : Le token doit avoir 'files.content.write'.");
                 throw new Error("Erreur Upload: " + errText);
             }
             return await res.json();
+        };
+
+        const dbxDeleteFile = async (token, path) => {
+             // Optionnel : pour nettoyer l'ancien fichier si besoin
+             const res = await fetch(`${DROPBOX_API_URL}/files/delete_v2`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path })
+            });
+            // On ne throw pas d'erreur si ça échoue (ex: fichier déjà supprimé), on continue
+            return res.ok;
         };
 
         const delay = ms => new Promise(res => setTimeout(res, ms));
@@ -155,17 +166,26 @@
 
             // DATA
             const [tarifs, setTarifs] = useState([]);
-            const [fiches, setFiches] = useState([]); // Pour les fiches techniques
+            const [fiches, setFiches] = useState([]); 
+            const [dbMeta, setDbMeta] = useState(null); // INFO META SUR LA MAJ
             const [dbxConfig, setDbxConfig] = useState({ token: '', pathTarifs: '/Tarifs', pathFT: '/Fiches', geminiKey: '' });
             
             // UI
             const [view, setView] = useState('login'); 
             const [activeTab, setActiveTab] = useState('search'); 
-            const [searchMode, setSearchMode] = useState('tarifs'); // 'tarifs' ou 'fiches'
             const [searchQuery, setSearchQuery] = useState('');
             const [syncLog, setSyncLog] = useState('');
             const [syncStatus, setSyncStatus] = useState('idle');
             const [showConfigModal, setShowConfigModal] = useState(false);
+            const [isUploading, setIsUploading] = useState(false);
+            
+            // UI ADMIN SPECIFIC (GESTION TARIFS)
+            const [showAdminUploadModal, setShowAdminUploadModal] = useState(false);
+            const [adminUploadMode, setAdminUploadMode] = useState('new'); // 'new' or 'update'
+            const [targetTarifId, setTargetTarifId] = useState(''); // ID du tarif à écraser
+            
+            const uploadInputRef = useRef(null);
+            const adminFileInputRef = useRef(null);
 
             // INIT
             useEffect(() => {
@@ -173,27 +193,29 @@
                 const storedUsers = localStorage.getItem('tdbx_users');
                 const storedTarifs = localStorage.getItem('tdbx_tarifs'); 
                 const storedFiches = localStorage.getItem('tdbx_fiches');
+                const storedMeta = localStorage.getItem('tdbx_meta');
 
                 if (storedConfig) setDbxConfig(JSON.parse(storedConfig));
                 if (storedUsers) setUsers(JSON.parse(storedUsers));
                 if (storedTarifs) setTarifs(JSON.parse(storedTarifs));
                 if (storedFiches) setFiches(JSON.parse(storedFiches));
+                if (storedMeta) setDbMeta(JSON.parse(storedMeta));
             }, []);
 
             useEffect(() => { if(currentUser) localStorage.setItem('tdbx_config', JSON.stringify(dbxConfig)); }, [dbxConfig, currentUser]);
             useEffect(() => { if(currentUser) localStorage.setItem('tdbx_users', JSON.stringify(users)); }, [users, currentUser]);
             useEffect(() => { if(currentUser) localStorage.setItem('tdbx_tarifs', JSON.stringify(tarifs)); }, [tarifs, currentUser]);
             useEffect(() => { if(currentUser) localStorage.setItem('tdbx_fiches', JSON.stringify(fiches)); }, [fiches, currentUser]);
+            useEffect(() => { if(currentUser) localStorage.setItem('tdbx_meta', JSON.stringify(dbMeta)); }, [dbMeta, currentUser]);
 
             // AUTO-LOAD pour collaborateur
             useEffect(() => {
                 if (currentUser && currentUser.role === 'viewer' && dbxConfig.token && activeTab === 'search') {
-                    // Chargement silencieux si pas de données ou si l'utilisateur vient d'arriver
                     if (tarifs.length === 0 || fiches.length === 0) loadCloudDatabase();
                 }
             }, [currentUser, activeTab]);
 
-            // --- LOGIQUE ---
+            // --- LOGIQUE METIER ---
 
             const handleLogin = (e) => {
                 e.preventDefault();
@@ -203,11 +225,8 @@
                     setCurrentUser(user);
                     setLoginError('');
                     setView('dashboard');
-                    setSearchQuery(''); // Vide la recherche
-                    
-                    if (user.role === 'viewer' && !dbxConfig.token) {
-                        setShowConfigModal(true);
-                    }
+                    setSearchQuery('');
+                    if (user.role === 'viewer' && !dbxConfig.token) setShowConfigModal(true);
                 } else {
                     setLoginError('Identifiants incorrects');
                 }
@@ -216,7 +235,7 @@
             const handleLogout = () => {
                 setCurrentUser(null);
                 setView('login');
-                setLoginForm({ username: '', password: '' }); // Vide les champs
+                setLoginForm({ username: '', password: '' });
                 setSearchQuery('');
             };
 
@@ -230,12 +249,92 @@
 
             const handleAddUser = (newUser) => {
                 let updatedUsers = [...users, newUser];
-                // Supprimer l'admin par défaut si un nouvel admin est créé
-                if (newUser.role === 'admin') {
-                    updatedUsers = updatedUsers.filter(u => !(u.id === 'admin' && u.pass === 'admin'));
-                }
+                if (newUser.role === 'admin') updatedUsers = updatedUsers.filter(u => !(u.id === 'admin' && u.pass === 'admin'));
                 setUsers(updatedUsers);
             };
+
+            // Upload Fiche Technique (Collaborateur/Admin)
+            const handleUploadFiche = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                if (!dbxConfig.token) return alert("Token manquant.");
+
+                setIsUploading(true);
+                try {
+                    const targetPath = `${dbxConfig.pathFT || '/Fiches'}/${file.name}`;
+                    await dbxUploadFile(dbxConfig.token, targetPath, file);
+                    const newFiche = { id: 'local_' + Date.now(), name: file.name, path: targetPath, type: 'ft', server_modified: new Date().toISOString() };
+                    setFiches(prev => [newFiche, ...prev]);
+                    alert(`Fiche "${file.name}" ajoutée !`);
+                } catch (err) { alert("Erreur upload: " + err.message); } finally { setIsUploading(false); if(uploadInputRef.current) uploadInputRef.current.value = ''; }
+            };
+
+            // ADMIN : Gestion Manuelle Tarifs (Nouveau / Mise à jour)
+            const handleManualTarifUpload = async (e) => {
+                e.preventDefault();
+                const file = adminFileInputRef.current?.files[0];
+                if (!file) return alert("Veuillez sélectionner un fichier PDF.");
+                if (!dbxConfig.token || !dbxConfig.geminiKey) return alert("Configuration manquante.");
+
+                setSyncStatus('working');
+                setSyncLog(adminUploadMode === 'new' ? "Ajout nouveau tarif..." : "Mise à jour tarif...");
+                setShowAdminUploadModal(false); // Fermer la modal
+
+                try {
+                    // 1. Upload Dropbox
+                    const targetPath = `${dbxConfig.pathTarifs || '/Tarifs'}/${file.name}`;
+                    setSyncLog(`1/4 Upload vers Dropbox : ${file.name}...`);
+                    const uploadMeta = await dbxUploadFile(dbxConfig.token, targetPath, file);
+
+                    // 2. Analyse IA
+                    setSyncLog(`2/4 Analyse IA en cours...`);
+                    const analysis = await analyzePDF(file, file.name);
+                    
+                    // 3. Mise à jour Local State
+                    setSyncLog(`3/4 Mise à jour Base locale...`);
+                    let newTarifs = [...tarifs];
+
+                    if (adminUploadMode === 'update' && targetTarifId) {
+                        newTarifs = newTarifs.filter(t => t.id !== targetTarifId);
+                    }
+                    
+                    const docEntry = {
+                        id: uploadMeta.id,
+                        name: uploadMeta.name,
+                        path: uploadMeta.path_lower,
+                        server_modified: uploadMeta.server_modified,
+                        index_date: new Date().toLocaleString(),
+                        date_tarif: analysis.date_tarif || "Inconnue",
+                        products: analysis.products || []
+                    };
+                    newTarifs.push(docEntry);
+                    setTarifs(newTarifs);
+
+                    // 4. Publication DB Cloud avec META
+                    setSyncLog(`4/4 Publication base de données Cloud...`);
+                    
+                    const metaInfo = {
+                        date: new Date().toLocaleString(),
+                        user: currentUser.name,
+                        action: adminUploadMode === 'new' ? `Ajout tarif : ${file.name}` : `Mise à jour tarif : ${file.name}`
+                    };
+                    setDbMeta(metaInfo);
+
+                    const dbExport = { meta: metaInfo, tarifs: newTarifs, fiches: fiches };
+                    await dbxUploadFile(dbxConfig.token, '/db_tarifs.json', new Blob([JSON.stringify(dbExport)], { type: 'application/json' }));
+
+                    setSyncLog(`✅ Succès ! Tarif "${file.name}" traité.`);
+                    setSyncStatus('success');
+
+                } catch (err) {
+                    console.error(err);
+                    setSyncLog(`❌ Erreur : ${err.message}`);
+                    setSyncStatus('error');
+                } finally {
+                    if (adminFileInputRef.current) adminFileInputRef.current.value = '';
+                }
+            };
+
 
             // Analyse IA
             const analyzePDF = async (blob, filename) => {
@@ -270,18 +369,17 @@
                 }
             };
 
-            // SYNC
+            // SYNC FULL ADMIN
             const runFullSync = async (forceAll = false) => {
                 if (currentUser.role !== 'admin') return;
                 setSyncStatus('working');
-                setSyncLog("🔍 Démarrage du scan...");
+                setSyncLog("🔍 Démarrage du scan complet...");
                 
                 let currentFiches = [...fiches];
                 let currentTarifs = [...tarifs];
 
                 try {
-                    // 1. Tarifs
-                    setSyncLog("📄 Analyse Tarifs...");
+                    setSyncLog("📄 Analyse Dossier Tarifs...");
                     const listTarifs = await dbxListFolder(dbxConfig.token, dbxConfig.pathTarifs);
                     const dbxTarifs = listTarifs.entries.filter(e => e['.tag'] === 'file' && e.name.toLowerCase().endsWith('.pdf'));
                     currentTarifs = currentTarifs.filter(t => dbxTarifs.find(df => df.id === t.id));
@@ -290,7 +388,7 @@
                     for (const file of dbxTarifs) {
                         const existing = currentTarifs.find(t => t.id === file.id);
                         if (forceAll || !existing || existing.server_modified !== file.server_modified) {
-                            setSyncLog(`   > Traitement : ${file.name}...`);
+                            setSyncLog(`   > Indexation : ${file.name}...`);
                             const blob = await dbxDownloadFile(dbxConfig.token, file.path_lower);
                             await delay(1000);
                             const analysis = await analyzePDF(blob, file.name);
@@ -306,26 +404,27 @@
                     }
                     setTarifs(currentTarifs);
 
-                    // 2. Fiches Techniques (Scan simple des noms de fichiers)
                     if (dbxConfig.pathFT) {
-                        setSyncLog("📂 Indexation Fiches Techniques...");
+                        setSyncLog("📂 Scan Fiches Techniques...");
                         try {
                             const listFT = await dbxListFolder(dbxConfig.token, dbxConfig.pathFT);
                             const dbxFiches = listFT.entries.filter(e => e['.tag'] === 'file');
-                            currentFiches = dbxFiches.map(f => ({
-                                id: f.id, name: f.name, path: f.path_lower, type: 'ft', server_modified: f.server_modified
-                            }));
+                            currentFiches = dbxFiches.map(f => ({ id: f.id, name: f.name, path: f.path_lower, type: 'ft', server_modified: f.server_modified }));
                             setFiches(currentFiches);
-                            setSyncLog(`   > ${currentFiches.length} fiches indexées.`);
-                        } catch(e) { setSyncLog(`⚠️ Dossier Fiches introuvable: ${e.message}`); }
+                        } catch(e) {}
                     }
 
                     setSyncLog(`✅ Terminé ! ${processed} tarifs traités. Publication Cloud...`);
                     
-                    // Sauvegarde Cloud UNIFIÉE
-                    const dbExport = { tarifs: currentTarifs, fiches: currentFiches };
+                    const metaInfo = {
+                        date: new Date().toLocaleString(),
+                        user: currentUser.name,
+                        action: "Synchronisation globale (Scan complet)"
+                    };
+                    setDbMeta(metaInfo);
+
+                    const dbExport = { meta: metaInfo, tarifs: currentTarifs, fiches: currentFiches };
                     await dbxUploadFile(dbxConfig.token, '/db_tarifs.json', new Blob([JSON.stringify(dbExport)], { type: 'application/json' }));
-                    
                     setSyncStatus('success');
 
                 } catch (err) {
@@ -341,17 +440,14 @@
                     const blob = await dbxDownloadFile(dbxConfig.token, '/db_tarifs.json');
                     const text = await blob.text();
                     const data = JSON.parse(text);
-                    
-                    // Gestion de la compatibilité (ancien format tableau vs nouvel format objet)
-                    if (Array.isArray(data)) {
-                        setTarifs(data);
-                        setFiches([]);
-                    } else {
-                        setTarifs(data.tarifs || []);
+                    if (Array.isArray(data)) { 
+                        setTarifs(data); setFiches([]); 
+                    } else { 
+                        setTarifs(data.tarifs || []); 
                         setFiches(data.fiches || []);
+                        if (data.meta) setDbMeta(data.meta);
                     }
-
-                    setSyncLog("Données synchronisées (Tarifs + Fiches).");
+                    setSyncLog("Données synchronisées.");
                     setSyncStatus('success');
                 } catch (e) {
                     setSyncLog("Erreur chargement cloud : " + e.message);
@@ -362,47 +458,30 @@
             // --- RENDER ---
             
             const searchResults = useMemo(() => {
-                if (!searchQuery || searchQuery.length < 2) return [];
+                if (!searchQuery || searchQuery.length < 2) return { products: [], fiches: [] };
                 const q = searchQuery.toLowerCase();
-                
-                if (searchMode === 'tarifs') {
-                    const res = [];
-                    tarifs.forEach(t => {
-                        if (t.products) {
-                            t.products.forEach(p => {
-                                if (p.name?.toLowerCase().includes(q)) {
-                                    res.push({ ...p, source: t.name, date_tarif: t.date_tarif, path: t.path, type: 'prod' });
-                                }
-                            });
-                        }
+                const foundProducts = [];
+                tarifs.forEach(t => {
+                    if (t.products) t.products.forEach(p => {
+                        if (p.name?.toLowerCase().includes(q)) foundProducts.push({ ...p, source: t.name, date_tarif: t.date_tarif, path: t.path, type: 'prod' });
                     });
-                    return res;
-                } else {
-                    return fiches.filter(f => f.name.toLowerCase().includes(q));
-                }
-            }, [searchQuery, tarifs, fiches, searchMode]);
+                });
+                const foundFiches = fiches.filter(f => f.name.toLowerCase().includes(q));
+                return { products: foundProducts, fiches: foundFiches };
+            }, [searchQuery, tarifs, fiches]);
 
-            // VUE LOGIN (LIGHT THEME)
             if (view === 'login') return (
                 <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
                     <div className="w-full max-w-md p-8 bg-white/80 backdrop-blur-xl rounded-3xl shadow-xl border border-white/50 animate-fade">
                         <div className="text-center mb-8">
-                            <div className="inline-flex p-3 bg-blue-600 rounded-2xl shadow-lg shadow-blue-200 mb-4">
-                                <Icon name="Database" size={32} className="text-white"/>
-                            </div>
+                            <div className="inline-flex p-3 bg-blue-600 rounded-2xl shadow-lg shadow-blue-200 mb-4"><Icon name="Database" size={32} className="text-white"/></div>
                             <h1 className="text-3xl font-black text-slate-800 mb-1">Tarifiers<span className="text-blue-600">DBX</span></h1>
                             <p className="text-slate-500 font-medium text-sm">Portail Unifié CMGP-CAS</p>
                         </div>
                         <form onSubmit={handleLogin} className="space-y-4">
                             {loginError && <div className="bg-red-50 text-red-500 p-3 rounded-xl text-sm text-center font-bold border border-red-100">{loginError}</div>}
-                            <div>
-                                <label className="block text-xs font-bold uppercase text-slate-400 mb-1 ml-1">Identifiant</label>
-                                <input className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all font-medium text-slate-700" value={loginForm.username} onChange={e => setLoginForm({...loginForm, username: e.target.value})} placeholder="ex: admin" />
-                            </div>
-                            <div>
-                                <label className="block text-xs font-bold uppercase text-slate-400 mb-1 ml-1">Mot de passe</label>
-                                <input type="password" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 focus:ring-2 focus:ring-blue-500 outline-none transition-all font-medium text-slate-700" value={loginForm.password} onChange={e => setLoginForm({...loginForm, password: e.target.value})} placeholder="••••" />
-                            </div>
+                            <input className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 focus:ring-2 focus:ring-blue-500 outline-none font-medium text-slate-700" value={loginForm.username} onChange={e => setLoginForm({...loginForm, username: e.target.value})} placeholder="Identifiant (ex: admin)" />
+                            <input type="password" className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3.5 focus:ring-2 focus:ring-blue-500 outline-none font-medium text-slate-700" value={loginForm.password} onChange={e => setLoginForm({...loginForm, password: e.target.value})} placeholder="Mot de passe" />
                             <button className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg shadow-blue-200 transition-all transform active:scale-95 mt-2">Se Connecter</button>
                         </form>
                     </div>
@@ -426,10 +505,7 @@
                                 </div>
                             )}
                             <div className="h-8 w-px bg-slate-200 mx-1"></div>
-                            <button onClick={handleLogout} className="flex items-center gap-2 text-slate-500 hover:text-red-600 transition-colors text-sm font-medium">
-                                <span className="hidden md:inline">{currentUser.name}</span>
-                                <Icon name="LogOut" size={18} />
-                            </button>
+                            <button onClick={handleLogout} className="flex items-center gap-2 text-slate-500 hover:text-red-600 transition-colors text-sm font-medium"><span className="hidden md:inline">{currentUser.name}</span><Icon name="LogOut" size={18} /></button>
                         </div>
                     </nav>
 
@@ -447,64 +523,130 @@
                             </div>
                         )}
 
+                        {/* MODAL GESTION TARIF ADMIN */}
+                        {showAdminUploadModal && (
+                            <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center z-[60] p-4">
+                                <div className="bg-white p-8 rounded-3xl shadow-2xl max-w-md w-full animate-fade relative">
+                                    <button onClick={() => setShowAdminUploadModal(false)} className="absolute top-4 right-4 text-slate-400 hover:text-slate-600"><Icon name="X"/></button>
+                                    
+                                    <div className="mb-6">
+                                        <div className="inline-flex bg-blue-100 p-3 rounded-full text-blue-600 mb-3"><Icon name="FilePlus" size={24}/></div>
+                                        <h2 className="text-xl font-bold">Gestion des Tarifs</h2>
+                                        <p className="text-sm text-slate-500">Ajouter ou mettre à jour un catalogue</p>
+                                    </div>
+
+                                    <form onSubmit={handleManualTarifUpload} className="space-y-4">
+                                        <div className="flex bg-slate-50 p-1 rounded-xl">
+                                            <button type="button" onClick={() => setAdminUploadMode('new')} className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${adminUploadMode === 'new' ? 'bg-white shadow text-blue-600' : 'text-slate-400'}`}>Nouveau</button>
+                                            <button type="button" onClick={() => setAdminUploadMode('update')} className={`flex-1 py-2 text-sm font-bold rounded-lg transition-all ${adminUploadMode === 'update' ? 'bg-white shadow text-blue-600' : 'text-slate-400'}`}>Mise à jour</button>
+                                        </div>
+
+                                        {adminUploadMode === 'update' && (
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-500 uppercase mb-1 block">Tarif à remplacer</label>
+                                                <select className="w-full p-3 border rounded-xl text-sm bg-white" required value={targetTarifId} onChange={e => setTargetTarifId(e.target.value)}>
+                                                    <option value="">-- Choisir le tarif --</option>
+                                                    {tarifs.map(t => <option key={t.id} value={t.id}>{t.name} ({t.date_tarif})</option>)}
+                                                </select>
+                                            </div>
+                                        )}
+
+                                        <div>
+                                            <label className="text-xs font-bold text-slate-500 uppercase mb-1 block">Fichier PDF</label>
+                                            <input type="file" accept="application/pdf" required ref={adminFileInputRef} className="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                                        </div>
+
+                                        <button disabled={syncStatus === 'working'} className="w-full bg-slate-800 text-white py-3 rounded-xl font-bold mt-2 hover:bg-slate-900 disabled:opacity-50 flex items-center justify-center gap-2">
+                                            {syncStatus === 'working' ? <Icon name="Loader2" className="animate-spin"/> : <Icon name="UploadCloud"/>}
+                                            {adminUploadMode === 'new' ? 'Ajouter & Indexer' : 'Mettre à jour & Indexer'}
+                                        </button>
+                                    </form>
+                                </div>
+                            </div>
+                        )}
+
                         {/* SEARCH */}
                         {activeTab === 'search' && (
                             <div className="animate-fade">
                                 <div className="max-w-3xl mx-auto text-center mb-10">
-                                    <div className="inline-flex bg-white p-1 rounded-full shadow-sm border border-slate-200 mb-6">
-                                        <button onClick={() => setSearchMode('tarifs')} className={`px-6 py-2 rounded-full text-sm font-bold transition-all ${searchMode === 'tarifs' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-700'}`}>Tarifs Produits</button>
-                                        <button onClick={() => setSearchMode('fiches')} className={`px-6 py-2 rounded-full text-sm font-bold transition-all ${searchMode === 'fiches' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-700'}`}>Fiches Techniques</button>
+                                    <div className="mb-8">
+                                        <h2 className="text-2xl font-bold text-slate-800 mb-2">Catalogue Unifié</h2>
+                                        
+                                        {/* META INFO BANNER */}
+                                        {dbMeta && (
+                                            <div className="inline-block bg-blue-50 border border-blue-100 rounded-lg px-4 py-2 mb-4 animate-fade">
+                                                <div className="flex items-center gap-2 text-xs text-blue-800">
+                                                    <span className="font-bold flex items-center gap-1"><Icon name="Clock" size={12}/> MAJ: {dbMeta.date}</span>
+                                                    <span className="opacity-50">|</span>
+                                                    <span className="flex items-center gap-1"><Icon name="User" size={12}/> {dbMeta.user}</span>
+                                                    <span className="opacity-50">|</span>
+                                                    <span className="italic">{dbMeta.action}</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        
+                                        <div className="flex justify-center gap-4 text-sm text-slate-500">
+                                            <span>{tarifs.length} Catalogues Prix</span>
+                                            <span>•</span>
+                                            <span>{fiches.length} Fiches Techniques</span>
+                                        </div>
                                     </div>
-
                                     <div className="relative group z-10">
-                                        <input 
-                                            className="w-full p-5 pl-14 rounded-2xl border border-slate-200 shadow-xl shadow-slate-100 focus:ring-4 focus:ring-blue-50 outline-none text-lg font-medium transition-all"
-                                            placeholder={searchMode === 'tarifs' ? "Rechercher un produit (ex: Pompe H20)..." : "Rechercher une fiche technique..."}
-                                            value={searchQuery}
-                                            onChange={e => setSearchQuery(e.target.value)}
-                                            autoFocus
-                                        />
+                                        <input className="w-full p-5 pl-14 rounded-2xl border border-slate-200 shadow-xl shadow-slate-100 focus:ring-4 focus:ring-blue-50 outline-none text-lg font-medium transition-all" placeholder="Rechercher un produit ou une fiche..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} autoFocus />
                                         <div className="absolute left-5 top-5 text-slate-300 group-focus-within:text-blue-500 transition-colors"><Icon name="Search" size={24} /></div>
+                                    </div>
+                                    <div className="mt-4 flex justify-center">
+                                        <button onClick={() => uploadInputRef.current.click()} disabled={isUploading} className="text-xs font-bold text-slate-400 hover:text-blue-600 flex items-center gap-2 transition-colors bg-slate-50 hover:bg-blue-50 px-3 py-1.5 rounded-full">
+                                            <Icon name={isUploading ? "Loader2" : "UploadCloud"} size={14} className={isUploading ? "animate-spin" : ""}/>{isUploading ? "Envoi en cours..." : "Ajouter une fiche PDF"}
+                                        </button>
+                                        <input type="file" ref={uploadInputRef} onChange={handleUploadFiche} accept="application/pdf" className="hidden" />
                                     </div>
                                 </div>
 
-                                <div className="space-y-4 pb-20">
-                                    {searchResults.map((res, i) => (
-                                        <div key={i} className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-blue-300 hover:shadow-lg hover:shadow-blue-50 transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group">
-                                            <div className="flex items-start gap-4">
-                                                <div className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 ${searchMode === 'tarifs' ? 'bg-blue-50 text-blue-600' : 'bg-indigo-50 text-indigo-600'}`}>
-                                                    <Icon name={searchMode === 'tarifs' ? "Box" : "FileText"} size={24}/>
-                                                </div>
-                                                <div>
-                                                    <div className="font-bold text-slate-800 text-lg">{res.name}</div>
-                                                    {searchMode === 'tarifs' && (
-                                                        <div className="flex flex-wrap items-center gap-2 mt-2">
-                                                            <span className="bg-slate-100 px-2.5 py-1 rounded-lg text-xs font-bold text-slate-600 flex items-center gap-1">
-                                                                <Icon name="Folder" size={12}/> {res.source}
-                                                            </span>
-                                                            {/* DATE MISE EN EVIDENCE */}
-                                                            <span className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 ${res.date_tarif.includes("Non") ? "bg-red-50 text-red-500" : "bg-green-50 text-green-600 border border-green-100"}`}>
-                                                                <Icon name="Calendar" size={12}/> {res.date_tarif}
-                                                            </span>
+                                <div className="space-y-8 pb-20">
+                                    {searchResults.products.length > 0 && (
+                                        <div className="animate-fade">
+                                            <h3 className="text-sm font-bold uppercase text-slate-400 mb-4 pl-2 flex items-center gap-2"><Icon name="Box" size={16}/> Tarifs Produits ({searchResults.products.length})</h3>
+                                            <div className="space-y-3">
+                                                {searchResults.products.map((res, i) => (
+                                                    <div key={i} className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-blue-300 hover:shadow-lg hover:shadow-blue-50 transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 group">
+                                                        <div className="flex items-start gap-4">
+                                                            <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 bg-blue-50 text-blue-600"><Icon name="Tag" size={20}/></div>
+                                                            <div>
+                                                                <div className="font-bold text-slate-800 text-lg">{res.name}</div>
+                                                                <div className="flex flex-wrap items-center gap-2 mt-2">
+                                                                    <span className="bg-slate-100 px-2.5 py-1 rounded-lg text-xs font-bold text-slate-600 flex items-center gap-1"><Icon name="Folder" size={12}/> {res.source}</span>
+                                                                    <span className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 ${res.date_tarif.includes("Non") ? "bg-red-50 text-red-500" : "bg-green-50 text-green-600 border border-green-100"}`}><Icon name="Calendar" size={12}/> {res.date_tarif}</span>
+                                                                </div>
+                                                            </div>
                                                         </div>
-                                                    )}
-                                                </div>
-                                            </div>
-                                            <div className="flex items-center justify-between md:justify-end gap-6 pl-16 md:pl-0">
-                                                {searchMode === 'tarifs' && (
-                                                    <div className="text-2xl font-black text-blue-600 whitespace-nowrap">{res.price} <span className="text-xs text-slate-400 font-bold">{res.unit || 'DH'}</span></div>
-                                                )}
-                                                <button onClick={() => openFile(res.path)} className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-colors shadow-sm">
-                                                    <Icon name="Eye" size={14}/> {searchMode === 'tarifs' ? 'Voir Tarif' : 'Ouvrir PDF'}
-                                                </button>
+                                                        <div className="flex items-center justify-between md:justify-end gap-6 pl-14 md:pl-0">
+                                                            <div className="text-2xl font-black text-blue-600 whitespace-nowrap">{res.price} <span className="text-xs text-slate-400 font-bold">{res.unit || 'DH'}</span></div>
+                                                            <button onClick={() => openFile(res.path)} className="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-colors shadow-sm"><Icon name="Eye" size={14}/> Voir</button>
+                                                        </div>
+                                                    </div>
+                                                ))}
                                             </div>
                                         </div>
-                                    ))}
-                                    {searchQuery && searchResults.length === 0 && (
-                                        <div className="text-center py-12 text-slate-400">
-                                            <Icon name="Ghost" size={48} className="mx-auto mb-3 opacity-30"/>
-                                            <p className="font-medium">Aucun résultat trouvé.</p>
+                                    )}
+                                    {searchResults.fiches.length > 0 && (
+                                        <div className="animate-fade">
+                                            <h3 className="text-sm font-bold uppercase text-slate-400 mb-4 pl-2 flex items-center gap-2 border-t pt-6 mt-6 md:border-none md:pt-0 md:mt-0"><Icon name="FileText" size={16}/> Fiches Techniques ({searchResults.fiches.length})</h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                {searchResults.fiches.map((f, i) => (
+                                                    <div key={i} className="bg-white p-4 rounded-2xl border border-slate-100 hover:border-indigo-300 hover:shadow-md transition-all flex items-center justify-between group cursor-pointer" onClick={() => openFile(f.path)}>
+                                                        <div className="flex items-center gap-3">
+                                                            <div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0"><Icon name="FileText" size={20}/></div>
+                                                            <div className="truncate pr-4"><div className="font-bold text-slate-700 truncate">{f.name}</div><div className="text-xs text-slate-400">PDF • Fiche Technique</div></div>
+                                                        </div>
+                                                        <Icon name="Download" size={16} className="text-slate-300 group-hover:text-indigo-500"/>
+                                                    </div>
+                                                ))}
+                                            </div>
                                         </div>
+                                    )}
+                                    {searchQuery && searchResults.products.length === 0 && searchResults.fiches.length === 0 && (
+                                        <div className="text-center py-12 text-slate-400"><Icon name="Ghost" size={48} className="mx-auto mb-3 opacity-30"/><p className="font-medium">Aucun résultat trouvé.</p></div>
                                     )}
                                 </div>
                             </div>
@@ -517,36 +659,21 @@
                                     <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
                                         <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800"><Icon name="Settings" /> Paramètres</h3>
                                         <div className="space-y-4">
-                                            <div className="grid gap-1">
-                                                <label className="text-[10px] font-bold uppercase text-slate-400">Token Dropbox</label>
-                                                <input type="password" value={dbxConfig.token} onChange={e => setDbxConfig({...dbxConfig, token: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono" />
-                                            </div>
-                                            <div className="grid gap-1">
-                                                <label className="text-[10px] font-bold uppercase text-slate-400">Clé Gemini</label>
-                                                <input type="password" value={dbxConfig.geminiKey} onChange={e => setDbxConfig({...dbxConfig, geminiKey: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono" />
-                                            </div>
-                                            <div className="grid gap-1">
-                                                <label className="text-[10px] font-bold uppercase text-slate-400">Dossier Tarifs</label>
-                                                <input value={dbxConfig.pathTarifs} onChange={e => setDbxConfig({...dbxConfig, pathTarifs: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs" />
-                                            </div>
-                                            <div className="grid gap-1">
-                                                <label className="text-[10px] font-bold uppercase text-slate-400">Dossier Fiches</label>
-                                                <input value={dbxConfig.pathFT} onChange={e => setDbxConfig({...dbxConfig, pathFT: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs" />
-                                            </div>
+                                            <div className="grid gap-1"><label className="text-[10px] font-bold uppercase text-slate-400">Token Dropbox</label><input type="password" value={dbxConfig.token} onChange={e => setDbxConfig({...dbxConfig, token: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono" /></div>
+                                            <div className="grid gap-1"><label className="text-[10px] font-bold uppercase text-slate-400">Clé Gemini</label><input type="password" value={dbxConfig.geminiKey} onChange={e => setDbxConfig({...dbxConfig, geminiKey: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-mono" /></div>
+                                            <div className="grid gap-1"><label className="text-[10px] font-bold uppercase text-slate-400">Dossier Tarifs</label><input value={dbxConfig.pathTarifs} onChange={e => setDbxConfig({...dbxConfig, pathTarifs: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs" /></div>
+                                            <div className="grid gap-1"><label className="text-[10px] font-bold uppercase text-slate-400">Dossier Fiches</label><input value={dbxConfig.pathFT} onChange={e => setDbxConfig({...dbxConfig, pathFT: e.target.value})} className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs" /></div>
                                         </div>
                                     </div>
-                                    <div className="bg-slate-900 text-green-400 p-5 rounded-3xl font-mono text-xs h-60 overflow-y-auto shadow-inner">
-                                        <div className="opacity-50 border-b border-green-800 pb-2 mb-2">System Logs</div>
-                                        <div className="whitespace-pre-wrap">{syncLog || "Prêt."}</div>
-                                    </div>
+                                    <div className="bg-slate-900 text-green-400 p-5 rounded-3xl font-mono text-xs h-60 overflow-y-auto shadow-inner"><div className="opacity-50 border-b border-green-800 pb-2 mb-2">System Logs</div><div className="whitespace-pre-wrap">{syncLog || "Prêt."}</div></div>
                                 </div>
                                 <div className="lg:col-span-2 bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden flex flex-col h-[600px]">
                                     <div className="p-6 border-b border-slate-100 flex justify-between items-center bg-slate-50">
                                         <h3 className="font-bold text-lg text-slate-800">Indexation</h3>
-                                        <button onClick={() => runFullSync(false)} disabled={syncStatus === 'working'} className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-blue-200 transition-all active:scale-95 disabled:opacity-50 disabled:scale-100">
-                                            {syncStatus === 'working' ? <Icon name="Loader2" className="animate-spin"/> : <Icon name="RefreshCw"/>} 
-                                            Lancer Synchro
-                                        </button>
+                                        <div className="flex gap-2">
+                                            <button onClick={() => { setAdminUploadMode('new'); setShowAdminUploadModal(true); }} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-indigo-200 transition-all active:scale-95"><Icon name="Plus"/> Gestion Tarifs</button>
+                                            <button onClick={() => runFullSync(false)} disabled={syncStatus === 'working'} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-bold text-sm flex items-center gap-2 shadow-lg shadow-blue-200 transition-all active:scale-95 disabled:opacity-50"><Icon name={syncStatus === 'working' ? "Loader2" : "RefreshCw"} className={syncStatus === 'working' ? "animate-spin" : ""}/> Re-Scan Global</button>
+                                        </div>
                                     </div>
                                     <div className="flex-1 overflow-auto p-0">
                                         <table className="w-full text-sm text-left">
@@ -585,14 +712,8 @@
                                         handleAddUser({ name: e.target.name.value, id: e.target.login.value, pass: e.target.pass.value, role: e.target.role.value });
                                         e.target.reset();
                                     }} className="grid gap-4">
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <input name="name" placeholder="Nom Complet" required className="p-3 border rounded-xl text-sm" />
-                                            <select name="role" className="p-3 border rounded-xl text-sm bg-white"><option value="viewer">Collaborateur</option><option value="admin">Administrateur</option></select>
-                                        </div>
-                                        <div className="grid grid-cols-2 gap-4">
-                                            <input name="login" placeholder="Identifiant" required className="p-3 border rounded-xl text-sm" />
-                                            <input name="pass" placeholder="Mot de passe" required className="p-3 border rounded-xl text-sm" />
-                                        </div>
+                                        <div className="grid grid-cols-2 gap-4"><input name="name" placeholder="Nom Complet" required className="p-3 border rounded-xl text-sm" /><select name="role" className="p-3 border rounded-xl text-sm bg-white"><option value="viewer">Collaborateur</option><option value="admin">Administrateur</option></select></div>
+                                        <div className="grid grid-cols-2 gap-4"><input name="login" placeholder="Identifiant" required className="p-3 border rounded-xl text-sm" /><input name="pass" placeholder="Mot de passe" required className="p-3 border rounded-xl text-sm" /></div>
                                         <button className="bg-slate-800 text-white py-3 rounded-xl font-bold mt-2 hover:bg-slate-900">Ajouter l'utilisateur</button>
                                     </form>
                                 </div>
@@ -600,10 +721,7 @@
                                     <h4 className="text-xs font-bold uppercase text-slate-400 pl-4">Utilisateurs Actifs</h4>
                                     {users.map((u, i) => (
                                         <div key={i} className="flex items-center justify-between p-4 bg-white border border-slate-100 rounded-2xl">
-                                            <div className="flex items-center gap-3">
-                                                <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-white ${u.role === 'admin' ? 'bg-slate-800' : 'bg-blue-500'}`}>{u.name.charAt(0)}</div>
-                                                <div><div className="font-bold text-slate-800">{u.name}</div><div className="text-xs text-slate-500 uppercase font-bold">{u.role}</div></div>
-                                            </div>
+                                            <div className="flex items-center gap-3"><div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-white ${u.role === 'admin' ? 'bg-slate-800' : 'bg-blue-500'}`}>{u.name.charAt(0)}</div><div><div className="font-bold text-slate-800">{u.name}</div><div className="text-xs text-slate-500 uppercase font-bold">{u.role}</div></div></div>
                                             <button onClick={() => setUsers(users.filter((_, idx) => idx !== i))} className="p-2 text-slate-300 hover:text-red-500"><Icon name="Trash2"/></button>
                                         </div>
                                     ))}
